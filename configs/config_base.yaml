@@ -1,0 +1,32 @@
+grid_map:
+  FREE_SPACE: 0
+  OBSTACLE: 1
+
+default_map_size: 10
+default_num_agents: 4
+max_map_size: 100
+max_num_agents: 72
+
+ind_reward_func:
+  'move': -0.075
+  'stay_on_goal': 0
+  'stay_off_goal': -0.075
+  'collision': -0.5
+  'reach_goal': 3
+
+lambda_r: 0.9
+
+fov_size: [9, 9]
+K_obs: 3
+
+action_mapping:
+  0: [-1, 0]
+  1: [1, 0]
+  2: [0, -1]
+  3: [0, 1]
+  4: [0, 0]
+action_dim: 5
+
+hidden_channels: 128
+num_heads: 2
+hidden_dim: 256

@@ -1,0 +1,15 @@
+num_episodes: 72000
+warmup_episodes: 100
+num_rollout_threads: 2
+max_episode_length: 256
+buffer_size: 2048
+upgrade_threshold: 0.9
+save_interval: 10
+steps_per_update: 128
+batch_size: 32
+lr_pi: 0.01 # learning rate for the policy optimizer
+lr_q: 0.01 # learning rate for the critic optimizer
+tau: 0.01 # target update rate
+gamma: 0.95 # discount factor
+alpha: 0.1 # weight of the entrophy term
+curriculum: true
