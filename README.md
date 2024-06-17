@@ -2,7 +2,7 @@
 
 The code implementation for SACHA: Soft Actor-Critic with Heuristic-Based Attention for Partially Observable Multi-Agent Path Finding.
 
-![Model Design](https://raw.githubusercontent.com/Qiushi-Lin/SACHA/master/figures/model_design.png)
+![Model Design](https://raw.githubusercontent.com/Qiushi-Lin/SACHA/master/images/model_design.png)
 
 ## Setup
 **Dependencies**
