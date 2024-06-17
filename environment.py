@@ -1,209 +1,284 @@
+import random
+from typing import List
 import numpy as np
-import heapq
-import gymnasium as gym
-from gym import spaces
 
-from utils.make_instances import generate_random_map, map_partition, generate_random_agents
+from utils import map_partition
+
+# config
+import yaml
+config = yaml.safe_load(open("./config.yaml", 'r'))
 
 
-class POMAPFEnv(gym.Env):
-    def __init__(self, config):
-        self.OBSTACLE, self.FREE_SPACE = config['grid_map']['OBSTACLE'], config['grid_map']['FREE_SPACE']
-        self.fov_size = tuple(config['fov_size'])
-        self.obs_r = (int(np.floor(self.fov_size[0]/2)), int(np.floor(self.fov_size[1]/2)))
-        self.K_obs = config['K_obs']
-        self.ind_reward_func = config['ind_reward_func']
-        self.lambda_r = config['lambda_r']
+class POMAPFEnv:
+    def __init__(self):
         self.action_mapping = config['action_mapping']
-        self.action_dim = config['action_dim']
-        self.num_agents = config['default_num_agents']
-        self.max_num_agents = config['max_num_agents']
-        self.map_size = config['default_map_size']
-        self.grid_map = None
-        self.curr_state, self.goal_state = None, None
-        self.load_random_map()
-        self.heuristic_maps = {}
-        self._get_heuristic_maps()
+        self.default_env_setting = config['default_env_setting']
+        self.env_setting_set = [self.default_env_setting]
+        self.num_agents = self.default_env_setting[0]
+        self.map_size = (self.default_env_setting[1], self.default_env_setting[1])
 
-    @property
-    def observation_space(self):
-        return spaces.MultiDiscrete(np.ones((self.max_num_agents, self.K_obs, 3, self.fov_size[0], self.fov_size[1])))
-
-    @property
-    def action_space(self):
-        return spaces.Discrete(self.max_num_agents, self.action_dim)
-
-    def seed(self, seed=0):
-        np.random.seed(seed)
-
-    def reset(self, seed=0):
-        self.load_random_map()
-        self.seed(seed)
-        return self.observe(), None
-
-    def load(self, grid_map, curr_state, goal_state):
-        self.grid_map = grid_map
-        self.curr_state = curr_state
-        self.goal_state = goal_state        
-        self.num_agents = len(self.curr_state)
-        self.map_size = max(len(self.grid_map), len(self.grid_map[0]))
-        self._get_heuristic_maps()
-
-    def get_curr_state(self):
-        return self.curr_state
-
-    def get_level(self):
-        return self.map_size, self.num_agents
-
-    def set_level(self, map_size, num_agents):
-        self.map_size = map_size
-        self.num_agents = num_agents
-        self.load_random_map()
-        self._get_heuristic_maps()
-
-    def load_random_map(self):
-        num_obstacles = np.floor(self.map_size * self.map_size * np.random.triangular(0, 0.33, 0.5))
-        self.grid_map = generate_random_map(self.map_size, self.map_size, num_obstacles)
-        map_partitions = map_partition(self.grid_map)
-        self.curr_state, self.goal_state = generate_random_agents(self.grid_map, map_partitions, self.num_agents)
-
-    def _move(self, loc, move):
-        action = self.action_mapping[int(move)]
-        return (loc[0] + action[0], loc[1] + action[1])
-
-    def _get_heuristic_maps(self):
-        self.heuristic_maps = {}
-        self.padded_heuristic_maps = {}
+        self.obstacle_density = np.random.triangular(0, 0.33, 0.5)
+        self.map = np.random.choice(2, self.map_size, p=[1-self.obstacle_density, self.obstacle_density]).astype(int)
+        partition_list = map_partition(self.map)
+        partition_list = [ partition for partition in partition_list if len(partition) >= 2 ]
+        while len(partition_list) == 0:
+            self.map = np.random.choice(2, self.map_size, p=[1-self.obstacle_density, self.obstacle_density]).astype(int)
+            partition_list = map_partition(self.map)
+            partition_list = [ partition for partition in partition_list if len(partition) >= 2 ]
+        
+        self.agents_pos = np.empty((self.num_agents, 2), dtype=int)
+        self.goals_pos = np.empty((self.num_agents, 2), dtype=int)
+        pos_num = sum([ len(partition) for partition in partition_list ])
+        
+        # loop to assign agent original position and goal position for each agent
         for i in range(self.num_agents):
-            self.heuristic_maps[i] = np.zeros(np.shape(self.grid_map))
-            goal = self.goal_state[i]
-            open_list = []
-            closed_list = {}
-            root = {'loc': goal, 'cost': 0}
-            heapq.heappush(open_list, (root['cost'], goal, root))
-            closed_list[goal] = root
-            while len(open_list) > 0:
-                (cost, loc, curr) = heapq.heappop(open_list)
-                for d in range(4):
-                    child_loc = self._move(loc, d)
-                    child_cost = cost + 1
-                    if child_loc[0] < 0 or child_loc[0] >= self.map_size \
-                    or child_loc[1] < 0 or child_loc[1] >= self.map_size:
-                        continue
-                    if self.grid_map[child_loc[0]][child_loc[1]] == self.OBSTACLE:
-                        continue
-                    child = {'loc': child_loc, 'cost': child_cost}
-                    if child_loc in closed_list:
-                        existing_node = closed_list[child_loc]
-                        if existing_node['cost'] > child_cost:
-                            closed_list[child_loc] = child
-                            heapq.heappush(open_list, (child_cost, child_loc, child))
-                    else:
-                        closed_list[child_loc] = child
-                        heapq.heappush(open_list, (child_cost, child_loc, child))
-
-            for x in range(self.map_size):
-                for y in range(self.map_size):
-                    if (x, y) in closed_list:
-                        self.heuristic_maps[i][x][y] = closed_list[(x, y)]['cost'] / (self.map_size * self.map_size)
-                    else:
-                        self.heuristic_maps[i][x][y] = 1.0
-
-    def _detect_vertex_collision(self, path1, path2):
-        if np.array_equal(path1[1], path2[1]):
-            return True
-        return False
-
-    def _detect_edge_collision(self, path1, path2):
-        if np.array_equal(path1[1], path2[0]) and np.array_equal(path1[0], path2[1]):
-            return True
-        return False
-
-    def step(self, action):
-        reward = [0 for _ in range(self.num_agents)]
-        paths = []
-        for i in range(self.num_agents):
-            next_state = self.curr_state[i]
-            if action[i] == 4:
-                if np.array_equal(next_state, self.goal_state[i]):
-                    reward[i] = self.ind_reward_func['stay_on_goal']
+            pos_idx = random.randint(0, pos_num-1)
+            partition_idx = 0
+            for partition in partition_list:
+                if pos_idx >= len(partition):
+                    pos_idx -= len(partition)
+                    partition_idx += 1
                 else:
-                    reward[i] = self.ind_reward_func['stay_off_goal']
+                    break 
+            pos = random.choice(partition_list[partition_idx])
+            partition_list[partition_idx].remove(pos)
+            self.agents_pos[i] = np.asarray(pos, dtype=int)
+            pos = random.choice(partition_list[partition_idx])
+            partition_list[partition_idx].remove(pos)
+            self.goals_pos[i] = np.asarray(pos, dtype=int)
+            partition_list = [partition for partition in partition_list if len(partition) >= 2]
+            pos_num = sum([ len(partition) for partition in partition_list ])
+
+        self.obs_radius = config['obs_radius']
+        self.reward_fn = config['reward_fn']
+        self.get_heuristic_map()
+        self.num_steps = 0
+        self.last_actions = np.zeros((self.num_agents, 5, 2*self.obs_radius+1, 2*self.obs_radius+1), dtype=np.bool)
+
+    def update_env_setting_set(self, new_env_setting_set):
+        self.env_setting_set = new_env_setting_set
+
+    def reset(self):
+        rand_env_setting = random.choice(self.env_setting_set)
+        self.num_agents = rand_env_setting[0]
+        self.map_size = (rand_env_setting[1], rand_env_setting[1])
+        self.obstacle_density = np.random.triangular(0, 0.33, 0.5)
+        
+        self.map = np.random.choice(2, self.map_size, p=[1-self.obstacle_density, self.obstacle_density]).astype(np.float32)
+        partition_list = map_partition(self.map)
+        partition_list = [ partition for partition in partition_list if len(partition) >= 2 ]
+        while len(partition_list) == 0:
+            self.map = np.random.choice(2, self.map_size, p=[1-self.obstacle_density, self.obstacle_density]).astype(np.float32)
+            partition_list = map_partition(self.map)
+            partition_list = [ partition for partition in partition_list if len(partition) >= 2 ]
+        self.agents_pos = np.empty((self.num_agents, 2), dtype=int)
+        self.goals_pos = np.empty((self.num_agents, 2), dtype=int)
+        pos_num = sum([ len(partition) for partition in partition_list ])
+        
+        for i in range(self.num_agents):
+            pos_idx = random.randint(0, pos_num-1)
+            partition_idx = 0
+            for partition in partition_list:
+                if pos_idx >= len(partition):
+                    pos_idx -= len(partition)
+                    partition_idx += 1
+                else:
+                    break 
+            pos = random.choice(partition_list[partition_idx])
+            partition_list[partition_idx].remove(pos)
+            self.agents_pos[i] = np.asarray(pos, dtype=int)
+            pos = random.choice(partition_list[partition_idx])
+            partition_list[partition_idx].remove(pos)
+            self.goals_pos[i] = np.asarray(pos, dtype=int)
+            partition_list = [ partition for partition in partition_list if len(partition) >= 2 ]
+            pos_num = sum([ len(partition) for partition in partition_list ])
+        self.num_steps = 0
+        self.get_heuristic_map()
+        self.last_actions = np.zeros((self.num_agents, 5, 2*self.obs_radius+1, 2*self.obs_radius+1), dtype=np.bool)
+
+        return self.observe()
+
+    def load(self, map:np.ndarray, agents_pos:np.ndarray, goals_pos:np.ndarray):
+        self.map = np.copy(map)
+        self.agents_pos = np.copy(agents_pos)
+        self.goals_pos = np.copy(goals_pos)
+        self.num_agents = agents_pos.shape[0]
+        self.map_size = (self.map.shape[0], self.map.shape[1])
+        self.num_steps = 0
+        self.get_heuristic_map()
+        self.last_actions = np.zeros((self.num_agents, 5, 2*self.obs_radius+1, 2*self.obs_radius+1), dtype=np.bool)
+
+    def get_heuristic_map(self):
+        dist_map = np.ones((self.num_agents, *self.map_size), dtype=int) * float('inf')
+        for i in range(self.num_agents):
+            open_list = list()
+            x, y = tuple(self.goals_pos[i])
+            open_list.append((x, y))
+            dist_map[i, x, y] = 0
+
+            while open_list:
+                x, y = open_list.pop(0)
+                dist = dist_map[i, x, y]
+                up = x-1, y
+                if up[0] >= 0 and self.map[up]==0 and dist_map[i, x-1, y] > dist+1:
+                    dist_map[i, x-1, y] = dist+1
+                    if up not in open_list:
+                        open_list.append(up)
+                down = x+1, y
+                if down[0] < self.map_size[0] and self.map[down]==0 and dist_map[i, x+1, y] > dist+1:
+                    dist_map[i, x+1, y] = dist+1
+                    if down not in open_list:
+                        open_list.append(down)
+                left = x, y-1
+                if left[1] >= 0 and self.map[left]==0 and dist_map[i, x, y-1] > dist+1:
+                    dist_map[i, x, y-1] = dist+1
+                    if left not in open_list:
+                        open_list.append(left)
+                right = x, y+1
+                if right[1] < self.map_size[1] and self.map[right]==0 and dist_map[i, x, y+1] > dist+1:
+                    dist_map[i, x, y+1] = dist+1
+                    if right not in open_list:
+                        open_list.append(right)
+        self.heuri_map = np.zeros((self.num_agents, 4, *self.map_size), dtype=np.bool)
+
+        for x in range(self.map_size[0]):
+            for y in range(self.map_size[1]):
+                if self.map[x, y] == 0:
+                    for i in range(self.num_agents):
+                        if x > 0 and dist_map[i, x-1, y] < dist_map[i, x, y]:
+                            assert dist_map[i, x-1, y] == dist_map[i, x, y]-1
+                            self.heuri_map[i, 0, x, y] = 1
+                        if x < self.map_size[0]-1 and dist_map[i, x+1, y] < dist_map[i, x, y]:
+                            assert dist_map[i, x+1, y] == dist_map[i, x, y]-1
+                            self.heuri_map[i, 1, x, y] = 1
+                        if y > 0 and dist_map[i, x, y-1] < dist_map[i, x, y]:
+                            assert dist_map[i, x, y-1] == dist_map[i, x, y]-1
+                            self.heuri_map[i, 2, x, y] = 1
+                        if y < self.map_size[1]-1 and dist_map[i, x, y+1] < dist_map[i, x, y]:
+                            assert dist_map[i, x, y+1] == dist_map[i, x, y]-1
+                            self.heuri_map[i, 3, x, y] = 1
+        self.heuri_map = np.pad(self.heuri_map, ((0, 0), (0, 0), (self.obs_radius, self.obs_radius), (self.obs_radius, self.obs_radius)))
+
+    def step(self, actions: List[int]):
+        assert len(actions) == self.num_agents, 'only {} actions as input while {} agents in environment'.format(len(actions), self.num_agents)
+        assert all([action_idx<5 and action_idx>=0 for action_idx in actions]), 'action index out of range'
+
+        checking_list = [i for i in range(self.num_agents)]
+
+        rewards = []
+        next_pos = np.copy(self.agents_pos)
+
+        # remove unmoving agent id
+        for agent_id in checking_list.copy():
+            if actions[agent_id] == 0:
+                # unmoving
+                if np.array_equal(self.agents_pos[agent_id], self.goals_pos[agent_id]):
+                    rewards.append(self.reward_fn['stay_on_goal'])
+                else:
+                    rewards.append(self.reward_fn['stay_off_goal'])
+                checking_list.remove(agent_id)
             else:
-                x, y = self._move(self.curr_state[i], action[i])
-                # obstacle check
-                if 0 <= x < self.map_size and 0 <= y < self.map_size and self.grid_map[x][y] == self.FREE_SPACE:
-                    next_state = (x, y)
-                    reward[i] = self.ind_reward_func['move'] - (1 - self.lambda_r) * self.heuristic_maps[i][x][y]
-                else:
-                    reward[i] = self.ind_reward_func['collision']
-            paths.append([self.curr_state[i], next_state])
-        # edge collision check
-        for i in range(self.num_agents):
-            for j in range(i+1, self.num_agents):
-                if self._detect_edge_collision(paths[i], paths[j]):
-                    paths[i][1] = self.curr_state[i]
-                    paths[j][1] = self.curr_state[j]
-                    reward[i] = self.ind_reward_func['collision']
-                    reward[j] = self.ind_reward_func['collision']
-        # vertex collision check
-        collision_flag = True
-        while collision_flag:
-            collision_flag = False
-            for i in range(self.num_agents):
-                for j in range(i+1, self.num_agents):
-                    if self._detect_vertex_collision(paths[i], paths[j]):
-                        k = i
-                        if np.array_equal(paths[i][0], paths[i][1]):
-                            k = j
-                        elif np.array_equal(paths[j][0], paths[j][1]):
-                            k = i
-                        else:
-                            x, y = paths[i][1]
-                            if self.heuristic_maps[i][x][y] > self.heuristic_maps[j][x][y]:
-                                k = j
-                        paths[k][1] = self.curr_state[k]
-                        reward[k] = self.ind_reward_func['collision']
-                        collision_flag = True
+                # move
+                next_pos[agent_id] += self.action_mapping[actions[agent_id]]
+                rewards.append(self.reward_fn['move'])
+
+        # first round check, these two conflicts have the heightest priority
+        for agent_id in checking_list.copy():
+            if np.any(next_pos[agent_id]<0) or np.any(next_pos[agent_id]>=self.map_size[0]):
+                # agent out of map range
+                rewards[agent_id] = self.reward_fn['collision']
+                next_pos[agent_id] = self.agents_pos[agent_id]
+                checking_list.remove(agent_id)
+            elif self.map[tuple(next_pos[agent_id])] == 1:
+                # collide obstacle
+                rewards[agent_id] = self.reward_fn['collision']
+                next_pos[agent_id] = self.agents_pos[agent_id]
+                checking_list.remove(agent_id)
+
+        # second round check, agent swapping conflict
+        no_conflict = False
+        while not no_conflict:
+            no_conflict = True
+            for agent_id in checking_list:
+                target_agent_id = np.where(np.all(next_pos[agent_id]==self.agents_pos, axis=1))[0]
+                if target_agent_id:
+                    target_agent_id = target_agent_id.item()
+                    assert target_agent_id != agent_id, 'logic bug'
+                    if np.array_equal(next_pos[target_agent_id], self.agents_pos[agent_id]):
+                        assert target_agent_id in checking_list, 'target_agent_id should be in checking list'
+                        next_pos[agent_id] = self.agents_pos[agent_id]
+                        rewards[agent_id] = self.reward_fn['collision']
+                        next_pos[target_agent_id] = self.agents_pos[target_agent_id]
+                        rewards[target_agent_id] = self.reward_fn['collision']
+                        checking_list.remove(agent_id)
+                        checking_list.remove(target_agent_id)
+                        no_conflict = False
                         break
 
-        next_curr_state = []
-        for i in range(self.num_agents):
-            next_curr_state.append(paths[i][1])
-        self.curr_state = next_curr_state
-        done = [np.equal(x, y).all() for x, y in zip(self.curr_state, self.goal_state)]
-        if all(done):
-            reward = [self.ind_reward_func['reach_goal'] for _ in range(self.num_agents)]
-        obs = self.observe()
-        info = {'num_agents': self.num_agents, 'num_finished_agents': sum(done)}
-        return obs, reward, done, None, info
+        # third round check, agent collision conflict
+        no_conflict = False
+        while not no_conflict:
+            no_conflict = True
+            for agent_id in checking_list:
+                collide_agent_id = np.where(np.all(next_pos==next_pos[agent_id], axis=1))[0].tolist()
+                if len(collide_agent_id) > 1:
+                    # collide agent
+                    # if all agents in collide agent are in checking list
+                    all_in_checking = True
+                    for id in collide_agent_id.copy():
+                        if id not in checking_list:
+                            all_in_checking = False
+                            collide_agent_id.remove(id)
+                    if all_in_checking:
+                        collide_agent_pos = next_pos[collide_agent_id].tolist()
+                        for pos, id in zip(collide_agent_pos, collide_agent_id):
+                            pos.append(id)
+                        collide_agent_pos.sort(key=lambda x: x[0]*self.map_size[0]+x[1])
+                        collide_agent_id.remove(collide_agent_pos[0][2])
+                    next_pos[collide_agent_id] = self.agents_pos[collide_agent_id]
+                    for id in collide_agent_id:
+                        rewards[id] = self.reward_fn['collision']
+                    for id in collide_agent_id:
+                        checking_list.remove(id)
+                    no_conflict = False
+                    break
+
+        self.agents_pos = np.copy(next_pos)
+        self.num_steps += 1
+
+        # check done
+        if np.array_equal(self.agents_pos, self.goals_pos):
+            done = True
+            rewards = [self.reward_fn['reach_goal'] for _ in range(self.num_agents)]
+        else:
+            done = False
+        info = {'step': self.num_steps-1}
+
+        # make sure no overlapping agents
+        if np.unique(self.agents_pos, axis=0).shape[0] < self.num_agents:
+            print(self.num_steps)
+            print(self.map)
+            print(self.agents_pos)
+            raise RuntimeError('unique')
+
+        # update last actions
+        self.last_actions = np.zeros((self.num_agents, 5, 2*self.obs_radius+1, 2*self.obs_radius+1), dtype=np.bool)
+        self.last_actions[np.arange(self.num_agents), np.array(actions)] = 1
+
+        return self.observe(), rewards, done, info
+
 
     def observe(self):
-        padded_grid_map = np.pad(self.grid_map, ((self.obs_r[0], self.obs_r[0]), (self.obs_r[1], self.obs_r[1])), mode='constant', constant_values=self.OBSTACLE)
-        padded_heuristic_maps = {}
-        for i in range(self.num_agents):
-            padded_heuristic_maps[i] =  np.pad(self.heuristic_maps[i], ((self.obs_r[0], self.obs_r[0]), (self.obs_r[1], self.obs_r[1])), mode='constant', constant_values=1.0)
-        observed_agents = {}
-        for i in range(self.num_agents):
-            p = []
-            for j in range(self.num_agents):
-                x_i, y_i = self.curr_state[i][0], self.curr_state[i][1]
-                x_j, y_j = self.curr_state[j][0], self.curr_state[j][1]
-                if abs(x_i - x_j) <= self.obs_r[0] and abs(y_i - y_j) <= self.obs_r[1]:
-                    heapq.heappush(p, (abs(x_i - x_j) + abs(y_i - y_j), j))
-            observed_agents[i] = []
-            for k in range(self.K_obs):
-                if len(p):
-                    _, a = heapq.heappop(p)
-                    observed_agents[i].append(a)
-                else:
-                    break
-        obs = np.zeros((self.num_agents, self.K_obs, 3, self.fov_size[0], self.fov_size[1]))
-        for i in range(self.num_agents):
-            for k, j in enumerate(observed_agents[i]):
-                obs[i][k][0] = padded_grid_map[self.curr_state[i][0]:self.curr_state[i][0]+self.fov_size[0],self.curr_state[i][1]:self.curr_state[i][1]+self.fov_size[1]]
-                o_x = self.obs_r[0] - self.curr_state[i][0] + self.curr_state[j][0]
-                o_y = self.obs_r[1] - self.curr_state[i][1] + self.curr_state[j][1]
-                obs[i][k][1][o_x][o_y] = 1.0
-                obs[i][k][2] = padded_heuristic_maps[j][self.curr_state[i][0]:self.curr_state[i][0]+self.fov_size[0],self.curr_state[i][1]:self.curr_state[i][1]+self.fov_size[1]]
-        return obs # (num_agents, self.K_obs, 3, fov_size[0], fov_size[1])
+        obs = np.zeros((self.num_agents, 6, 2*self.obs_radius+1, 2*self.obs_radius+1), dtype=np.bool)
+        obstacle_map = np.pad(self.map, self.obs_radius, 'constant', constant_values=0)
+        agent_map = np.zeros((self.map_size), dtype=np.bool)
+        agent_map[self.agents_pos[:,0], self.agents_pos[:,1]] = 1
+        agent_map = np.pad(agent_map, self.obs_radius, 'constant', constant_values=0)
+        for i, agent_pos in enumerate(self.agents_pos):
+            x, y = agent_pos
+            obs[i, 0] = agent_map[x:x+2*self.obs_radius+1, y:y+2*self.obs_radius+1]
+            obs[i, 0, self.obs_radius, self.obs_radius] = 0
+            obs[i, 1] = obstacle_map[x:x+2*self.obs_radius+1, y:y+2*self.obs_radius+1]
+            obs[i, 2:] = self.heuri_map[i, :, x:x+2*self.obs_radius+1, y:y+2*self.obs_radius+1]
+
+        return obs, np.copy(self.agents_pos)

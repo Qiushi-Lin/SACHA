@@ -4,7 +4,7 @@ import copy
 
 # config
 import yaml
-config = yaml.safe_load(open("./configs/config_base.yaml", 'r'))
+config = yaml.safe_load(open("./config.yaml", 'r'))
 FREE_SPACE, OBSTACLE = config['grid_map']['FREE_SPACE'], config['grid_map']['OBSTACLE']
 action_mapping = config['action_mapping']
 
@@ -22,7 +22,6 @@ def generate_random_map(height, width, num_obstacles):
 
 
 def move(loc, d):
-    directions = [(0, -1), (0, 1), (-1, 0), (1, 0)]
     return loc[0] + action_mapping[d][0], loc[1] + action_mapping[d][1]
 
 
@@ -49,20 +48,3 @@ def map_partition(grid_map):
             close_list.append(loc)
         partitions.append(close_list)
     return partitions
-
-
-def generate_random_agents(grid_map, map_partitions, num_agents):
-    starts, goals = [], []
-    counter = 0
-    partitions = copy.deepcopy(map_partitions)
-    while counter < num_agents:
-        partitions = [p for p in partitions if len(p) >= 2]
-        partition_index = random.randint(0, len(partitions) - 1)
-        si, sj = random.choice(partitions[partition_index])
-        partitions[partition_index].remove((si, sj))
-        gi, gj = random.choice(partitions[partition_index])
-        partitions[partition_index].remove((gi, gj))
-        starts.append((si, sj))
-        goals.append((gi, gj))
-        counter += 1
-    return starts, goals

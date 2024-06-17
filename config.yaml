@@ -1,0 +1,92 @@
+grid_map:
+  FREE_SPACE: 0
+  OBSTACLE: 1
+
+default_env_setting: [1, 10]
+max_num_agents: 64
+max_map_length: 80
+
+reward_fn:
+  'move': -0.075
+  'stay_on_goal': 0
+  'stay_off_goal': -0.075
+  'collision': -0.5
+  'reach_goal': 3
+
+obs_radius: 4
+
+K_obs: 3
+max_comm_agents: 3
+forward_steps: 2
+
+# actions: 0: stay; 1: up; 2: down; 3: left; 4: right
+action_mapping:
+  0: [0, 0]
+  1: [-1, 0]
+  2: [1, 0]
+  3: [0, -1]
+  4: [0, 1]
+action_dim: 5
+
+num_channels: 128
+hidden_dim: 256
+comm_output_dim: 64
+num_comm_heads: 2
+num_comm_layers: 2
+
+# prioritized replay
+alpha_pr: 0.6
+beta_pr: 0.4
+
+batch_size: 192
+max_episode_length: 256
+global_capacity: 2048
+seq_len: 16
+upgrade_rate: 0.9
+# training
+num_episodes: 600000
+learning_threshold: 50000
+steps_per_update: 400
+episodes_per_target_update: 2000
+save_interval: 10
+save_path: './models'
+log_interval: 10
+num_workers: 20
+
+
+lr_pi: 0.01 # learning rate for the policy optimizer
+lr_q: 0.01 # learning rate for the critic optimizer
+tau: 0.01 # target update rate
+gamma: 0.95 # discount factor
+alpha: 0.1 # weight of the entrophy term
+lambda_r: 0.9
+
+
+# evaluation
+test_settings:
+  - ['random32', 4]
+  - ['random32', 8]
+  - ['random32', 16]
+  - ['random32', 32]
+  - ['random32', 64]
+  - ['random64', 4]
+  - ['random64', 8]
+  - ['random64', 16]
+  - ['random64', 32]
+  - ['random64', 64]
+  - ['den312d', 4]
+  - ['den312d', 8]
+  - ['den312d', 16]
+  - ['den312d', 32]
+  - ['den312d', 64]
+  - ['warehouse', 4]
+  - ['warehouse', 8]
+  - ['warehouse', 16]
+  - ['warehouse', 32]
+  - ['warehouse', 64]
+max_timesteps:
+  'random32': 256
+  'random64': 256
+  'den312d': 256
+  'warehouse': 512
+num_instances_per_test: 300

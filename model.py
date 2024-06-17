@@ -1,228 +1,223 @@
-import copy
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
-
+from torch.nn.utils.rnn import pack_padded_sequence
+from torch.cuda.amp import autocast
 
 # config
 import yaml
-config = yaml.safe_load(open("./configs/config_base.yaml", 'r'))
-policy_input_shape = (config['K_obs'], 3, config['fov_size'][0], config['fov_size'][1])
-policy_output_shape = config['action_dim']
-action_dim = config['action_dim']
-hidden_channels = config['hidden_channels']
-hidden_dim = config['hidden_dim']
-fov_size = tuple(config['fov_size'])
-obs_r = (int(np.floor(fov_size[0]/2)), int(np.floor(fov_size[1]/2)))
-num_heads = config['num_heads']
-K_obs = config['K_obs']
+config = yaml.safe_load(open("./config.yaml", 'r'))
 
 
-class MHABlock(nn.Module):
+class ResBlock(nn.Module):
+    def __init__(self, channel):
+        super().__init__()
+        self.block1 = nn.Conv2d(channel, channel, 3, 1, 1)
+        self.block2 = nn.Conv2d(channel, channel, 3, 1, 1)
+
+    def forward(self, x):
+        identity = x
+        x = self.block1(x)
+        x = F.relu(x)
+        x = self.block2(x)
+        x += identity
+        x = F.relu(x)
+
+        return x
+
+class MultiHeadAttention(nn.Module):
     def __init__(self, input_dim, output_dim, num_heads):
         super().__init__()
+        self.num_heads = num_heads
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         self.W_Q = nn.Linear(input_dim, output_dim * num_heads)
         self.W_K = nn.Linear(input_dim, output_dim * num_heads)
         self.W_V = nn.Linear(input_dim, output_dim * num_heads)
         self.W_O = nn.Linear(output_dim * num_heads, output_dim, bias=False)
-        self.mha = nn.MultiheadAttention(output_dim * num_heads, num_heads, batch_first=True)
 
-    def forward(self, x):
-        output, _ = self.mha(self.W_Q(x), self.W_K(x), self.W_V(x))
-        output = self.W_O(output)
-        return output
+    def forward(self, input, attn_mask):
+        # input: [batch_size x num_agents x input_dim]
+        batch_size, num_agents, input_dim = input.size()
+        assert input_dim == self.input_dim
+        
+        # (B, S, D) -proj-> (B, S, D) -split-> (B, S, H, W) -trans-> (B, H, S, W)
+        q_s = self.W_Q(input).view(batch_size, num_agents, self.num_heads, -1).transpose(1,2)  # q_s: [batch_size x num_heads x num_agents x output_dim]
+        k_s = self.W_K(input).view(batch_size, num_agents, self.num_heads, -1).transpose(1,2)  # k_s: [batch_size x num_heads x num_agents x output_dim]
+        v_s = self.W_V(input).view(batch_size, num_agents, self.num_heads, -1).transpose(1,2)  # v_s: [batch_size x num_heads x num_agents x output_dim]
 
+        if attn_mask.dim() == 2:
+            attn_mask = attn_mask.unsqueeze(0)
+        assert attn_mask.size(0) == batch_size, 'mask dim {} while batch size {}'.format(attn_mask.size(0), batch_size)
 
-# https://github.com/tkipf/pygcn
-class GCNLayer(nn.Module):
-    def __init__(self, in_features, out_features, use_bias=True):
-        super().__init__()
-        self.weight = nn.Parameter(torch.FloatTensor(torch.zeros(size=(in_features, out_features))))
-        if use_bias:
-            self.bias = nn.Parameter(torch.FloatTensor(torch.zeros(size=(out_features,))))
-        else:
-            self.register_parameter('bias', None)
+        attn_mask = attn_mask.unsqueeze(1).repeat_interleave(self.num_heads, 1) # attn_mask : [batch_size x num_heads x num_agents x num_agents]
+        assert attn_mask.size() == (batch_size, self.num_heads, num_agents, num_agents)
 
-        self.initialize_weights()
+        # context: [batch_size x num_heads x num_agents x output_dim]
+        with autocast(enabled=False):
+            scores = torch.matmul(q_s.float(), k_s.float().transpose(-1, -2)) / (self.output_dim**0.5) # scores : [batch_size x n_heads x num_agents x num_agents]
+            scores.masked_fill_(attn_mask, -1e9) # Fills elements of self tensor with value where mask is one.
+            attn = F.softmax(scores, dim=-1)
 
-    def initialize_weights(self):
-        nn.init.xavier_uniform_(self.weight)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+        context = torch.matmul(attn, v_s)
+        context = context.transpose(1, 2).contiguous().view(batch_size, num_agents, self.num_heads*self.output_dim) # context: [batch_size x len_q x n_heads * d_v]
+        output = self.W_O(context)
 
-    def forward(self, x, adj):
-        x = x @ self.weight
-        if self.bias is not None:
-            x += self.bias
-        return torch.sparse.mm(adj, x)
-
+        return output # output: [batch_size x num_agents x output_dim]
 
 class CommBlock(nn.Module):
-    def __init__(self, hidden_dim, dropout=0.5, use_bias=True):
+    def __init__(self, input_dim):
         super().__init__()
-        self.gcn_1 = GCNLayer(hidden_dim, hidden_dim)
-        self.gcn_2 = GCNLayer(hidden_dim, hidden_dim)
-        self.dropout = nn.Dropout(p=dropout)
-
-    def initialize_weights(self):
-        self.gcn_1.initialize_weights()
-        self.gcn_2.initialize_weights()
-
-    def forward(self, x, adj):
-        x = F.relu(self.gcn_1(x, adj))
-        x = self.dropout(x)
-        x = self.gcn_2(x, adj)
-        return x
+        self.input_dim = input_dim
+        self.output_dim = config['comm_output_dim']
+        self.num_heads = config['num_comm_heads']
+        self.num_layers = config['num_comm_layers']
+        self.batch_size = config['batch_size']
+        self.self_attn = MultiHeadAttention(input_dim, self.output_dim, self.num_heads)
+        self.update_cell = nn.GRUCell(self.output_dim, input_dim)
 
 
-class ResBlock(nn.Module):
-    def __init__(self, num_channels):
+    def forward(self, latent, comm_mask):
+        '''
+        latent shape: batch_size x num_agents x latent_dim
+        
+        '''
+        num_agents = latent.size(1)
+
+        # agent indices of agent that use communication
+        update_mask = comm_mask.sum(dim=-1) > 1
+        comm_idx = update_mask.nonzero(as_tuple=True)
+
+        # no agent use communication, return
+        if len(comm_idx[0]) == 0:
+            return latent
+
+        if len(comm_idx)>1:
+            update_mask = update_mask.unsqueeze(2)
+
+        attn_mask = comm_mask==False
+
+        for _ in range(self.num_layers):
+
+            info = self.self_attn(latent, attn_mask=attn_mask)
+            # latent = attn_layer(latent, attn_mask=attn_mask)
+            if len(comm_idx)==1:
+
+                batch_idx = torch.zeros(len(comm_idx[0]), dtype=torch.long)
+                latent[batch_idx, comm_idx[0]] = self.update_cell(info[batch_idx, comm_idx[0]], latent[batch_idx, comm_idx[0]])
+            else:
+                update_info = self.update_cell(info.view(-1, self.output_dim), latent.view(-1, self.input_dim)).view(self.batch_size, num_agents, self.input_dim)
+                # update_mask = update_mask.unsqueeze(2)
+                latent = torch.where(update_mask, update_info, latent)
+                # latent[comm_idx] = self.update_cell(info[comm_idx], latent[comm_idx])
+                # latent = self.update_cell(info, latent)
+
+        return latent
+
+
+class PolicyNet(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=num_channels, out_channels=num_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(in_channels=num_channels, out_channels=num_channels, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        output = x
-        output = self.conv1(output)
-        output = F.relu(output)
-        output = self.conv2(output)
-        output += x
-        output = F.relu(output)
-        return output
-
-
-class AttentionPolicy(nn.Module):
-    def __init__(self, communication, input_shape=policy_input_shape, output_shape=policy_output_shape,
-                 hidden_channels=hidden_channels, hidden_dim=hidden_dim, num_heads=num_heads):
-        super().__init__()
-        self.communication = communication
-        self.input_shape = policy_input_shape
-        self.output_shape = policy_output_shape
-        self.hidden_channels = hidden_channels
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
+        self.obs_radius = config['obs_radius']
+        self.input_shape = (6, 2*self.obs_radius+1, 2*self.obs_radius+1)
+        self.latent_dim = 16*7*7
+        self.hidden_dim = config['hidden_dim']
+        self.max_num_agents = config['max_num_agents']
+        self.max_comm_agents = config['max_comm_agents']
+        self.num_channels = config['num_channels']
+        self.batch_size = config['batch_size']
         self.obs_encoder = nn.Sequential(
-            nn.Conv2d(in_channels=3, out_channels=self.hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(self.input_shape[0], self.num_channels, 3, 1),
             nn.ReLU(True),
-            ResBlock(self.hidden_channels),
-            ResBlock(self.hidden_channels),
-            ResBlock(self.hidden_channels),
-            nn.Conv2d(in_channels=hidden_channels, out_channels=16, kernel_size=1),
+            ResBlock(self.num_channels),
+            ResBlock(self.num_channels),
+            ResBlock(self.num_channels),
+            nn.Conv2d(self.num_channels, 16, 1, 1),
             nn.ReLU(True),
-            nn.Flatten(0),
+            nn.Flatten(),
         )
-        self.memory_encoder = nn.GRUCell(16 * self.input_shape[2] * self.input_shape[3], self.hidden_dim)
-        self.mha_block = MHABlock(self.hidden_dim, self.hidden_dim, self.num_heads)
-        self.comm_block = CommBlock(self.hidden_dim)
-        self.value_decoder = nn.Linear(self.hidden_dim, 1)
-        self.advantage_decoder = nn.Linear(self.hidden_dim, self.output_shape)
+        self.recurrent = nn.GRUCell(self.latent_dim, self.hidden_dim)
+        self.comm = CommBlock(self.hidden_dim)
+
+        # dueling q structure
+        self.adv = nn.Linear(self.hidden_dim, 5)
+        self.state = nn.Linear(self.hidden_dim, 1)
+        self.hidden = None
+
         for _, m in self.named_modules():
             if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def _get_adj_from_states(self, state):
-        num_agents = len(state)
-        adj = np.zeros((num_agents, num_agents), dtype=float)
-        for i in range(num_agents):
-            for j in range(i + 1, num_agents):
-                x_i, y_i = state[i][0], state[i][1]
-                x_j, y_j = state[j][0], state[j][1]
-                if abs(x_i - x_j) <= obs_r[0] and abs(y_i - y_j) <= obs_r[1]:
-                    adj[i][j] = 1.0
-                    adj[j][i] = 1.0
-        return adj
+    @torch.no_grad()
+    def step(self, obs, pos):
+        num_agents = obs.size(0)
 
-    def forward(self, obs, hidden, state):
-        num_agents = len(state)
-        next_hidden, latent = [], []
-        obs, hidden = obs.float(), hidden.float()
-        for i in range(num_agents):
-            o_i = [self.obs_encoder(obs[i, k,:]) for k in range(K_obs)]
-            o_i = [self.memory_encoder(o, h) for o, h in zip(o_i, hidden)]
-            o_i = torch.stack(o_i)
-            o_i = self.mha_block(o_i)
-            next_hidden.append(torch.sum(o_i, 0))
-            latent.append(torch.sum(o_i, 0))
-        if self.communication:
-            adj = torch.from_numpy(self._get_adj_from_states(state)).to(torch.float32)
-            latent = torch.stack(latent)
-            adj = adj.cuda(latent.get_device()) if latent.is_cuda else adj
-            latent = self.comm_block(latent, adj)
-        V_n = [self.value_decoder(x) for x in latent]
-        A_n = [self.advantage_decoder(x) for x in latent]
-        Q_n = [V + A - A.mean(0, keepdim=True) for V, A in zip(V_n, A_n)]
-        log_pi = [F.log_softmax(Q, dim=0) for Q in Q_n]
-        action = [torch.argmax(Q, dim=0) for Q in Q_n]
-        return action, torch.stack(next_hidden), log_pi
+        latent = self.obs_encoder(obs)
 
+        if self.hidden is None:
+            self.hidden = self.recurrent(latent)
+        else:
+            self.hidden = self.recurrent(latent, self.hidden)
 
-class AttentionCritic(nn.Module):
-    def __init__(self, action_dim=policy_output_shape, hidden_dim=hidden_dim,
-                 hidden_channels=hidden_channels, num_heads=num_heads):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.action_dim = action_dim
-        self.num_heads = num_heads
-        self.hidden_channels = hidden_channels
-        self.fov_encoder = nn.Sequential(
-            nn.Conv2d(in_channels=3, out_channels=self.hidden_channels, kernel_size=3, padding=1),
-            nn.ReLU(True),
-            ResBlock(self.hidden_channels),
-            ResBlock(self.hidden_channels),
-            ResBlock(self.hidden_channels),
-            nn.Conv2d(in_channels=hidden_channels, out_channels=16, kernel_size=1),
-            nn.ReLU(True),
-            nn.Flatten(0),
-        )
-        self.obs_encoder = nn.Linear(16 * fov_size[0] * fov_size[1], 16)
-        self.action_encoder = nn.Linear(action_dim, 16)
-        self.mha_block = MHABlock(32, 32, num_heads)
-        self.value_decoder = nn.Linear(32, 1)
-        self.advantage_decoder = nn.Linear(32, action_dim)
+        # from num_agents x hidden_dim to 1 x num_agents x hidden_dim
+        self.hidden = self.hidden.unsqueeze(0)
 
-    def _get_observed_agents_from_states(self, state):
-        num_agents = len(state)
-        observed_agents = [[] for _ in range(num_agents)]
-        for i in range(num_agents):
-            observed_agents[i].append(i)
-            for j in range(i + 1, num_agents):
-                x_i, y_i = state[i][0], state[i][1]
-                x_j, y_j = state[j][0], state[j][1]
-                if abs(x_i - x_j) <= obs_r[0] and abs(y_i - y_j) <= obs_r[1]:
-                    observed_agents[i].append(j)
-        return observed_agents
+        # masks for communication block
+        agents_pos = pos
+        pos_mat = (agents_pos.unsqueeze(1)-agents_pos.unsqueeze(0)).abs()
+        dist_mat = (pos_mat[:,:,0]**2+pos_mat[:,:,1]**2).sqrt()
+        # mask out agents that out of range of FOV
+        in_obs_mask = (pos_mat<=self.obs_radius).all(2)
+        # mask out agents that are far away
+        _, ranking = dist_mat.topk(min(self.max_comm_agents, num_agents), dim=1, largest=False)
+        dist_mask = torch.zeros((num_agents, num_agents), dtype=torch.bool)
+        dist_mask.scatter_(1, ranking, True)
+        comm_mask = torch.bitwise_and(in_obs_mask, dist_mask)
+        self.hidden = self.comm(self.hidden, comm_mask)
+        self.hidden = self.hidden.squeeze(0)
+        adv_val = self.adv(self.hidden)
+        state_val = self.state(self.hidden)
+        q_val = state_val + adv_val - adv_val.mean(1, keepdim=True)
+        actions = torch.argmax(q_val, 1).tolist()
 
-    def forward(self, obs, action, state):
-        num_agents = len(state)
-        observed_agents = self._get_observed_agents_from_states(state)
-        latent = []
-        for i in range(num_agents):
-            c_i = []
-            for j in observed_agents[i]:
-                o_j = [self.obs_encoder(self.fov_encoder(obs[j, k, :])) for k in range(K_obs)]
-                o_j = torch.mean(torch.stack(o_j), 0)
-                a_j = F.one_hot(action[j].clone().to(torch.int64), num_classes=action_dim).float()
-                a_j = self.action_encoder(a_j)
-                c_i.append(torch.concat((o_j, a_j)))
-            c_i = torch.stack(c_i)
-            c_i = self.mha_block(c_i)
-            latent.append(torch.sum(c_i, 0))
-        V_n = [self.value_decoder(x) for x in latent]
-        A_n = [self.advantage_decoder(x) for x in latent]
-        Q_n = [V + A - A.mean(0, keepdim=True) for V, A in zip(V_n, A_n)]
-        return Q_n
-    
-    def get_coma_baseline(self, obs, action, state):
-        b = []
-        for i in range(len(state)):
-            p = 0.0
-            for j in range(self.action_dim):
-                temp_action = copy.deepcopy(action)
-                temp_action[i] = j
-                p += self.forward(obs, action, state)[i] / self.action_dim
-            b.append(p)
-        return b
+        return actions, q_val.numpy(), self.hidden.numpy(), comm_mask.numpy()
+
+    def reset(self):
+        self.hidden = None
+
+    @autocast()
+    def forward(self, obs, steps, hidden, comm_mask):
+        # comm_mask shape: batch_size x seq_len x max_num_agents x max_num_agents
+        max_steps = obs.size(1)
+        num_agents = comm_mask.size(2)
+
+        assert comm_mask.size(2) == self.max_num_agents
+        obs = obs.transpose(1, 2)
+        obs = obs.contiguous().view(-1, *self.input_shape)
+        latent = self.obs_encoder(obs)
+        latent = latent.view(self.batch_size*num_agents, max_steps, self.latent_dim).transpose(0, 1)
+
+        hidden_buffer = []
+        for i in range(max_steps):
+            # hidden size: batch_size*num_agents x self.hidden_dim
+            hidden = self.recurrent(latent[i], hidden)
+            hidden = hidden.view(self.batch_size, num_agents, self.hidden_dim)
+            hidden = self.comm(hidden, comm_mask[:, i])
+            # only hidden from agent 0
+            hidden_buffer.append(hidden[:, 0])
+            hidden = hidden.view(self.batch_size*num_agents, self.hidden_dim)
+
+        # hidden buffer size: batch_size x seq_len x self.hidden_dim
+        hidden_buffer = torch.stack(hidden_buffer).transpose(0, 1)
+
+        # hidden size: batch_size x self.hidden_dim
+        hidden = hidden_buffer[torch.arange(self.batch_size), steps-1]
+
+        adv_val = self.adv(hidden)
+        state_val = self.state(hidden)
+
+        q_val = state_val + adv_val - adv_val.mean(1, keepdim=True)
+
+        return q_val
