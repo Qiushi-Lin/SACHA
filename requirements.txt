@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+numpy==2.0.0
+PyYAML==6.0.1
+ray==2.24.0
+torch==2.3.1+cu118
+tqdm==4.66.4
